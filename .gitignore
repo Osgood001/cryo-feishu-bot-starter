@@ -1,0 +1,9 @@
+.env
+.DS_Store
+*.log
+__pycache__/
+.pytest_cache/
+messages/inbox/*.md
+messages/outbox/*.md
+!messages/inbox/.gitkeep
+!messages/outbox/.gitkeep
