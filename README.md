@@ -7,6 +7,11 @@ This repo is a redacted extraction of an internal Cryochamber + Feishu workflow.
 It keeps the reusable operating model and wrapper scripts, but removes project
 history, credentials, real open IDs, chat IDs, prompts, and host-specific paths.
 
+Use it together with the standalone Cryochamber scheduler:
+
+- Cryochamber source: https://github.com/Osgood001/cryochamber
+- Current practice version: `0.2.6`
+
 ## What this gives you
 
 - A prompt contract for a scheduled agent: orient, work, record, schedule, hibernate.
@@ -15,27 +20,77 @@ history, credentials, real open IDs, chat IDs, prompts, and host-specific paths.
 - A separate proactive/status channel for operator notes.
 - Thin `lark-cli` wrappers for listing chats, scanning chat history, and posting
   proactive messages.
+- A practical install/configuration guide for wiring Cryochamber, a coding
+  agent, and Feishu/Lark together.
 - Redaction and security checklists for publishing agent prompts safely.
 
 ## Non-goals
 
-- This does not include a full scheduler daemon implementation.
 - This does not include Feishu app credentials or a hosted message bridge.
 - This does not include any production monitoring, database, or secret manager.
+- This does not publish private production prompts, open IDs, chat IDs, access
+  keys, message history, or host-specific paths.
 
 ## Quick start
 
-1. Install and authenticate `lark-cli` for your Feishu app.
-2. Copy `.env.example` to `.env` and fill in local values.
-3. Wire your inbox bridge to write Feishu-origin messages with frontmatter like
+1. Install Cryochamber:
+
+   ```bash
+   cargo install --git https://github.com/Osgood001/cryochamber --locked
+   cryo --version
+   cryo-agent --version
+   ```
+
+   The versions should match. This starter currently documents `0.2.6`.
+
+2. Install and authenticate `lark-cli` for your Feishu app. Your bot identity
+   needs message send/read scopes for group routing; user identity is optional
+   unless you need user-only Feishu operations.
+
+3. Create a chamber and copy the starter files:
+
+   ```bash
+   mkdir my-feishu-agent
+   cd my-feishu-agent
+   cryo init --agent codex
+   git clone https://github.com/Osgood001/cryo-feishu-bot-starter.git starter
+   cp -R starter/scripts starter/docs starter/examples starter/AGENTS.md .
+   cp starter/.env.example .env
+   ```
+
+4. Fill in `.env`, especially:
+
+   ```bash
+   LARK_CLI_PROFILE=your_lark_cli_profile
+   LARK_CLI_IDENTITY=bot
+   FEISHU_OUTBOX_DIR=messages/outbox
+   OPERATOR_OPEN_ID=ou_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+   ```
+
+5. Wire your Feishu inbox bridge to write Feishu-origin messages with frontmatter like
    `examples/inbox-message.md`.
-4. Configure your scheduler to inject the prompt in `docs/sanitized-prompt.md`.
-5. Run a session. The agent should:
+
+6. Put the hard routing rules from `AGENTS.md` and the workflow in
+   `docs/sanitized-prompt.md` into your agent prompt. In Feishu chambers, these
+   rules intentionally override Cryochamber's generic local-outbox reply path:
+   Feishu user replies go through `scripts/feishu-reply.sh`, while operator
+   status goes through `scripts/proactive-post.sh --user`.
+
+7. Start the chamber:
+
+   ```bash
+   cryo start --agent codex
+   ```
+
+8. In each session the agent should:
    - read the plan and TODOs,
-   - claim inbox messages,
+   - inspect or claim inbox messages,
    - answer Feishu messages with `scripts/feishu-reply.sh`,
    - send operator status with `scripts/proactive-post.sh --user ...`,
    - leave a next TODO before hibernating.
+
+See [docs/setup-guide.md](docs/setup-guide.md) for a fuller end-to-end setup
+and validation checklist.
 
 ## Repository layout
 
@@ -46,6 +101,7 @@ history, credentials, real open IDs, chat IDs, prompts, and host-specific paths.
 │   ├── cryochamber-runbook.md   # Session lifecycle
 │   ├── feishu-routing.md        # Reply/status routing model
 │   ├── redaction-checklist.md   # What to remove before publishing
+│   ├── setup-guide.md           # End-to-end install/config guide
 │   ├── sanitized-prompt.md      # Prompt template with placeholders
 │   └── security.md              # Operational safety notes
 ├── examples/
@@ -81,6 +137,19 @@ Operator status is a different channel:
 printf '%s\n' "Short status, next wake: 2026-01-01T10:30" \
   | scripts/proactive-post.sh --user ou_operator_xxx
 ```
+
+## Minimal validation
+
+```bash
+scripts/list-chats.sh
+scripts/scan-chat.sh oc_xxx 5
+printf '%s\n' "test reply" | scripts/feishu-reply.sh oc_xxx om_xxx
+printf '%s\n' "operator test" | scripts/proactive-post.sh --user ou_xxx
+cryo-agent todo add "heartbeat" --at "+30 minutes"
+cryo-agent hibernate --summary "setup validation complete"
+```
+
+Use real `oc_...` and `om_...` IDs only from a test message you control.
 
 ## License
 
