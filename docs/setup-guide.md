@@ -1,216 +1,83 @@
-# Setup Guide
+# Setup and service guide
 
-This guide turns the starter repo into a working Feishu/Lark agent chamber.
-It assumes Linux or macOS, a coding agent such as Codex/Claude/OpenCode, and a
-Feishu app that can read/send messages through `lark-cli`.
+Start with the [one-page quickstart](../README.md), then complete these checks before a live canary.
 
-## Architecture
+## 1. Feishu and lark-cli
 
-The production pattern has four pieces:
+- Publish a bot-enabled Feishu app and subscribe to `im.message.receive_v1`.
+- Apply only the scopes in [Feishu routing](feishu-routing.md).
+- Initialize a named lark-cli profile with `--app-secret-stdin`. Bot identity
+  uses app configuration/scopes and must not run `auth login`; when user OAuth
+  is required, use the README's scoped `--no-wait --json` → QR → later
+  `--device-code` flow.
+- Set the profile name, executable paths, bot name/open ID, and local directories in `.env`; never put tokens/app secrets there.
+- Confirm `whoami`, `auth scopes`, and `event schema im.message.receive_v1` under the selected profile.
 
-1. **Cryochamber** runs the lifecycle: schedule, wake, inject prompt, track
-   TODOs, and hibernate.
-2. **Coding agent** does the work inside each session.
-3. **Feishu bridge** writes inbound Feishu messages into `messages/inbox/` and
-   delivers reply files from `messages/outbox/`.
-4. **Wrapper scripts** keep routing explicit:
-   - `scripts/feishu-reply.sh` writes a reply tied to one source
-     `feishu_chat_id` + `feishu_message_id`.
-   - `scripts/proactive-post.sh` intentionally posts to a chosen group or user.
-   - `scripts/scan-chat.sh`, `scripts/scan-all.sh`, and `scripts/list-chats.sh`
-     inspect Feishu context through `lark-cli`.
-
-## 1. Install Cryochamber
-
-Install the current practice version from the standalone repository:
+## 2. Local layout and permissions
 
 ```bash
-cargo install --git https://github.com/Osgood001/cryochamber --locked
-cryo --version
-cryo-agent --version
+mkdir -p messages/inbox messages/outbox .connector
+chmod 700 messages messages/inbox messages/outbox .connector
+chmod 600 .env
 ```
 
-Both commands should report the same version. This starter is written against
-`0.2.6`.
+Set the lark-cli auth/config directory to `0700` and every credential/backup file to `0600`. The connector creates state/inbox files with restrictive modes but the service account and parent directories remain the operator's responsibility.
 
-If you prefer to build from a checked-out source tree:
+## 3. Validate without sending
 
 ```bash
-git clone https://github.com/Osgood001/cryochamber.git
-cd cryochamber
-cargo install --path . --locked
+scripts/smoke-test.sh
+python3 -m unittest discover -s tests -v
+python3 -m py_compile connector/feishu_connector.py scripts/*.py tests/*.py tests/fakes/*
+for file in scripts/*.sh templates/ssh/*.sh; do bash -n "$file"; done
+python3 scripts/secret-scan.py
+git diff --check
 ```
 
-## 2. Create the chamber directory
+If `shellcheck` is installed, run `shellcheck scripts/*.sh templates/ssh/*.sh`. The fake-only smoke must pass before a CLI dry-run or canary.
+
+## 4. Inspect resolved connector configuration
 
 ```bash
-mkdir my-feishu-agent
-cd my-feishu-agent
-cryo init --agent codex
+set -a; . ./.env; set +a
+python3 connector/feishu_connector.py check
 ```
 
-You can use another agent command:
+This probes optional `external-ack` and prints only non-secret configuration. On public Cryochamber v0.2.6, `external_ack` should be false.
+
+## 5. Install one connector supervisor
+
+Choose systemd **or** supervisord, not both.
+
+### systemd user service
+
+Replace every token in `templates/systemd/feishu-connector.service`, copy it to the user's systemd directory, then:
 
 ```bash
-cryo init --agent claude
-cryo init --agent opencode
+systemd-analyze verify REPLACE_WITH_RENDERED_SERVICE_PATH
+systemctl --user daemon-reload
+systemctl --user enable --now feishu-connector.service
+systemctl --user status feishu-connector.service
 ```
 
-Check `cryo.toml` after init. The important default for Feishu integration is:
+### supervisord
 
-```toml
-watch_dirs = ["messages/inbox"]
-```
+Replace every token in `templates/supervisord/feishu-connector.conf`, place it in the configured include directory, then use the supervisor's normal reread/update/status workflow. Ensure its process environment has the same connector values as `.env`; do not embed app secrets or tokens.
 
-That makes new inbox files wake the chamber.
+The active-node crontab template is for a later bounded job, not for supervising this always-on connector. This repo intentionally does not ship a dispatcher/watchdog implementation; see [operations](operations.md).
 
-## 3. Add the Feishu starter files
+## 6. Controlled canary
 
-```bash
-git clone https://github.com/Osgood001/cryo-feishu-bot-starter.git starter
-cp -R starter/scripts starter/docs starter/examples starter/AGENTS.md .
-cp starter/.env.example .env
-mkdir -p messages/inbox messages/outbox
-```
+Use a dedicated test chat and operator account:
 
-Edit `.env`:
+1. Send one direct message or group @mention to the bot.
+2. Confirm one mode-0600 inbox file with the source IDs.
+3. Confirm the agent creates one exact-ID outbox item.
+4. Confirm one Feishu reply, then an archived item and terminal ledger state.
+5. Confirm an ambient wake produces no source-chat message.
 
-```bash
-LARK_CLI_PROFILE=your_lark_cli_profile
-LARK_CLI_IDENTITY=bot
-BOT_SIGNATURE="sent by your agent"
-FEISHU_OUTBOX_DIR=messages/outbox
-OPERATOR_OPEN_ID=ou_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
-DEFAULT_FEISHU_CHAT_ID=oc_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
-```
+Do not test proactive routing against a production group. Stop on duplicate/unknown delivery, wrong identity, unexpected scopes, or unredacted logs.
 
-Do not commit `.env`.
+## 7. Upgrade/rollback and recovery
 
-## 4. Authenticate `lark-cli`
-
-Install `lark-cli` following its own documentation, then authenticate the Feishu
-app profile you will use for this bot.
-
-Validate read/send access:
-
-```bash
-scripts/list-chats.sh
-scripts/scan-chat.sh <oc_test_chat_id> 5
-printf '%s\n' "operator test" \
-  | scripts/proactive-post.sh --user <ou_operator_open_id>
-```
-
-Use a test chat or private operator account first.
-
-## 5. Wire inbound messages
-
-Your Feishu event bridge should write each inbound message to `messages/inbox/`
-as Markdown with YAML frontmatter:
-
-```markdown
----
-from: Feishu user
-source: feishu
-feishu_chat_id: oc_xxx
-feishu_message_id: om_xxx
-feishu_sender: ou_xxx
-feishu_sender_name: Example User
-feishu_thread_id: "(none)"
----
-
-Message text here.
-
-Reply with:
-scripts/feishu-reply.sh oc_xxx om_xxx "<text>"
-```
-
-The bridge can be simple: webhook handler in, Markdown file out. The key
-requirement is that each file carries the exact `oc_...` chat ID and `om_...`
-message ID from the source message.
-
-## 6. Wire outbound replies
-
-`scripts/feishu-reply.sh` writes a routed reply file under `messages/outbox/`.
-Your bridge should watch that directory, parse frontmatter, and call Feishu to
-reply to the source message.
-
-The bridge must not route by "last active chat". It should route only by:
-
-```yaml
-feishu_chat_id: oc_xxx
-feishu_message_id: om_xxx
-```
-
-Proactive posts do not use the outbox bridge. They call `lark-cli` directly:
-
-```bash
-printf '%s\n' "public update" | scripts/proactive-post.sh --chat oc_xxx
-printf '%s\n' "private status" | scripts/proactive-post.sh --user ou_xxx
-```
-
-## 7. Update the agent prompt
-
-Add `AGENTS.md` and `docs/sanitized-prompt.md` to the prompt you give the
-coding agent.
-
-Important Feishu override:
-
-- Generic Cryochamber docs use `cryo-agent send` for local operator messages.
-- A Feishu chamber must not use that local outbox as a Feishu reply.
-- Feishu-origin messages are answered only with `scripts/feishu-reply.sh`.
-- Progress and wake-up notes go only to the operator with
-  `scripts/proactive-post.sh --user`.
-
-This separation is the main protection against cross-talk between groups.
-
-## 8. Start and test
-
-Start the chamber:
-
-```bash
-cryo start --agent codex
-```
-
-Send a controlled Feishu test message that mentions the bot or otherwise enters
-the inbox bridge. Confirm:
-
-1. A file appears in `messages/inbox/`.
-2. Cryochamber wakes the agent.
-3. The agent uses `scripts/feishu-reply.sh` with the message's own IDs.
-4. Your bridge delivers the matching outbox reply to Feishu.
-5. The session ends with a pending TODO and `cryo-agent hibernate`.
-
-Useful checks:
-
-```bash
-cryo status
-cryo log
-cryo-agent todo list
-```
-
-## Safety checklist
-
-Before publishing or sharing your own derived starter:
-
-- Replace real `oc_...`, `om_...`, and `ou_...` IDs with placeholders.
-- Remove access keys, webhook secrets, bearer tokens, and local paths.
-- Remove private conversation history.
-- Keep only reusable prompt rules, not private project instructions.
-- Run a secret scan:
-
-  ```bash
-  rg -n "Bearer|Authorization|accessKey|secret|token|password|AK|SK|OPENAI|ANTHROPIC|BOHRIUM" .
-  ```
-
-## Common mistakes
-
-- Replying through a local/operator outbox instead of exact Feishu IDs.
-- Posting status updates into the group where a user asked a question.
-- Forgetting to quote relative TODO times:
-
-  ```bash
-  cryo-agent todo add "check inbox" --at "+30 minutes"
-  ```
-
-- Letting the bridge route by the last active chat.
-- Committing `.env`, prompt transcripts, or real message archives.
+Follow [operations](operations.md). Preserve ledger, outbox, quarantine, and checkpoints across code rollback; never delete or blindly replay ambiguous sends. Rotate/revoke/restore credentials with [credentials](credentials.md), and migrate remote access with [SSH migration](ssh-migration.md).

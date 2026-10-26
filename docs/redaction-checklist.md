@@ -1,44 +1,15 @@
-# Redaction Checklist
+# Public redaction checklist
 
-Use this before publishing prompts, configs, traces, or wrapper scripts.
+Remove credentials, OAuth/device codes, cookies, real Feishu IDs, tenant/app identifiers, internal hosts/IPs, private paths, message content, attachments, prompt transcripts, production traces, and infrastructure names.
 
-## Remove or replace
+Keep only reusable invariants, placeholder examples, high-level diagrams, negative boundaries, and deterministic fake evidence.
 
-- Access keys, tokens, passwords, cookies, session IDs, OAuth device codes.
-- Raw Feishu `open_id`, `union_id`, `chat_id`, `message_id`, and tenant IDs
-  unless they are intentionally public examples.
-- Internal hostnames, private IPs, SSH aliases, and local absolute paths.
-- Customer data, private documents, message transcripts, and attachments.
-- Proprietary benchmark artifacts that are not cleared for sharing.
-- Full system/developer prompts if they include private policy, credentials, or
-  operational history.
-
-## Keep
-
-- The reusable routing invariant.
-- Placeholder-based command templates.
-- Minimal examples with fake IDs.
-- High-level architecture and session lifecycle.
-- Security boundaries and failure modes.
-
-## Suggested placeholders
-
-```text
-oc_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
-om_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
-ou_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
-cli_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
-https://example.internal.invalid
-/path/to/project
-```
-
-## Final check
-
-Run these before publishing:
+Before publishing:
 
 ```bash
-rg -n "accessKey|Authorization|Bearer|token|secret|password|AK|SK|open_id|chat_id|message_id|ou_|oc_|om_|cli_" .
-git diff --cached
+python3 scripts/secret-scan.py
+git diff --check
+git diff -- . ':!*.log'
 ```
 
-Review matches manually. Some placeholder matches are expected.
+The scanner is a high-confidence gate, not proof of absence. Manually inspect every placeholder-like ID, URL, hostname, absolute path, auth command, fixture, and generated artifact. A backup checksum proves integrity, not recoverability; test an actual restore as described in [credentials](credentials.md).
