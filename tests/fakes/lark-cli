@@ -1,0 +1,12 @@
+#!/usr/bin/env python3
+"""Recording fake for wrapper/connector tests; never performs network I/O."""
+import json
+import os
+import sys
+
+path = os.environ.get("FAKE_LARK_LOG")
+if path:
+    with open(path, "a", encoding="utf-8") as fh:
+        fh.write(json.dumps(sys.argv[1:]) + "\n")
+print(os.environ.get("FAKE_LARK_OUTPUT", '{"ok": true}'))
+raise SystemExit(int(os.environ.get("FAKE_LARK_RC", "0")))

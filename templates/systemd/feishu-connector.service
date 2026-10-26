@@ -1,0 +1,23 @@
+# User-service template. Replace every REPLACE_WITH_* token before installing.
+[Unit]
+Description=Cryochamber Feishu connector
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=REPLACE_WITH_ABSOLUTE_CHAMBER_PATH
+EnvironmentFile=REPLACE_WITH_ABSOLUTE_CHAMBER_PATH/.env
+ExecStart=/usr/bin/env python3 REPLACE_WITH_ABSOLUTE_CHAMBER_PATH/connector/feishu_connector.py run
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=20s
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=REPLACE_WITH_ABSOLUTE_CHAMBER_PATH
+
+[Install]
+WantedBy=default.target

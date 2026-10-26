@@ -14,7 +14,8 @@ hibernate.
 - Feishu-origin inbox messages must be answered only with:
 
   ```bash
-  scripts/feishu-reply.sh <feishu_chat_id> <feishu_message_id> "text"
+  printf '%s\n' "$message" \
+    | scripts/feishu-reply.sh <feishu_chat_id> <feishu_message_id> --stdin
   ```
 
 - Use the IDs from the exact message being answered.
@@ -22,14 +23,18 @@ hibernate.
 - Operator progress/status/wake notes must use:
 
   ```bash
-  scripts/proactive-post.sh --user <operator_open_id> "status"
+  printf '%s\n' "$status" \
+    | scripts/proactive-post.sh --user <operator_open_id> --stdin
   ```
 
 - Proactive group posts require an intentional target chat:
 
   ```bash
-  scripts/proactive-post.sh --chat <chat_id> "message"
+  printf '%s\n' "$announcement" \
+    | scripts/proactive-post.sh --chat <chat_id> --stdin
   ```
+- Ambient wakes with no source message stay silent unless an actionable fault
+  requires an operator DM.
 
 ## Session workflow
 
@@ -53,6 +58,7 @@ hibernate.
    - Ensure there is a pending TODO with a valid wake time unless the chamber is
      truly complete.
    - Remove stale duplicate TODOs.
+   - At 20 minutes, checkpoint and leave one bounded continuation TODO.
 
 5. Hibernate
    - Hibernate as the final action.
@@ -70,6 +76,13 @@ For each inbox item:
 - If the message asks about code, read the local source tree before answering.
 - If the message asks for a public group update, use `proactive-post.sh --chat`
   only after verifying the target chat.
+
+## Capability boundary
+
+- Public Cryochamber v0.2.6 does not include `external-ack`; probe before use.
+- Inbound polling fallback and bot-created/own-thread routing are not supported.
+- Thread metadata may be preserved, but every reply still targets its exact
+  source message.
 
 ## Redaction rule
 
