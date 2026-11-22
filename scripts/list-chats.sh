@@ -6,7 +6,7 @@ DIR="$(cd "$(dirname "$0")" && pwd)"
 PROFILE="${LARK_CLI_PROFILE:-}"
 IDENTITY="${LARK_CLI_IDENTITY:-bot}"
 
-cmd=(lark-cli)
+cmd=("${LARK_CLI:-lark-cli}")
 if [ -n "$PROFILE" ]; then
   cmd+=(--profile "$PROFILE")
 fi

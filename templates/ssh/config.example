@@ -1,0 +1,16 @@
+# Replace the alias, host, user, and key filename. Never disable host-key checking.
+Host REPLACE_WITH_HOST_ALIAS
+    HostName host.example.invalid
+    User REPLACE_WITH_REMOTE_USER
+    Port 22
+    IdentityFile ~/.ssh/REPLACE_WITH_PRIVATE_KEY_FILENAME
+    IdentitiesOnly yes
+    PreferredAuthentications publickey
+    PasswordAuthentication no
+    StrictHostKeyChecking yes
+    UserKnownHostsFile ~/.ssh/known_hosts
+    RequestTTY no
+    ClearAllForwardings yes
+    PermitLocalCommand no
+    ServerAliveInterval 30
+    ServerAliveCountMax 3

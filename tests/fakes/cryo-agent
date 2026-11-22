@@ -1,0 +1,10 @@
+#!/usr/bin/env python3
+"""Controllable fake for Cryochamber feature-detection and acknowledgement tests."""
+import os
+import sys
+
+if sys.argv[1:] == ["external-ack", "--help"]:
+    print("fake external-ack help")
+    raise SystemExit(int(os.environ.get("FAKE_CRYO_HELP_RC", "0")))
+print(os.environ.get("FAKE_CRYO_ACK_OUTPUT", "matched=1, already=0, unknown=0"))
+raise SystemExit(int(os.environ.get("FAKE_CRYO_ACK_RC", "0")))

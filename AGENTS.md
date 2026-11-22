@@ -8,15 +8,13 @@ These rules are meant to be injected into the agent alongside
 - Feishu-origin inbox messages must be answered with:
 
   ```bash
-  scripts/feishu-reply.sh <feishu_chat_id> <feishu_message_id> "text"
+  printf '%s\n' "$message" \
+    | scripts/feishu-reply.sh <feishu_chat_id> <feishu_message_id> --stdin
   ```
 
 - Use the IDs from that exact message. Do not reuse IDs from another message.
-- For multiline replies, send via stdin:
-
-  ```bash
-  printf '%s\n' "$message" | scripts/feishu-reply.sh <chat_id> <message_id>
-  ```
+- Send multiline bodies through explicit `--stdin`; do not put them in a
+  positional argument.
 
 - Do not use generic local outbox/status commands as Feishu replies.
 
@@ -28,8 +26,11 @@ These rules are meant to be injected into the agent alongside
 - Send operator-only status with:
 
   ```bash
-  scripts/proactive-post.sh --user <operator_open_id> "short status"
+  printf '%s\n' "$status" \
+    | scripts/proactive-post.sh --user <operator_open_id> --stdin
   ```
+- On an ambient wake with no source message, remain silent unless an actionable
+  operator alert exists. Never post an ambient summary into a source chat.
 
 ## Session lifecycle
 
@@ -37,6 +38,7 @@ These rules are meant to be injected into the agent alongside
 - Claim inbox messages before doing background work.
 - Update TODOs as work progresses.
 - Leave a next scheduled TODO unless the chamber is intentionally complete.
+- At 20 minutes, checkpoint and leave one bounded continuation TODO.
 - Hibernate as the final action of a session.
 
 ## Safety
@@ -44,3 +46,6 @@ These rules are meant to be injected into the agent alongside
 - Never publish secrets, raw access keys, private URLs, local-only paths, or
   full prompt transcripts without redaction.
 - When in doubt, publish the reusable rule or shape, not the private content.
+- Public Cryochamber v0.2.6 has no `external-ack`; feature-detect it.
+- Do not claim inbound polling or bot-created/own-thread routing; neither is
+  implemented by this starter.

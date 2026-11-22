@@ -3,7 +3,10 @@
 *.log
 __pycache__/
 .pytest_cache/
+.connector/
 messages/inbox/*.md
 messages/outbox/*.md
+messages/outbox/archive/
+messages/outbox/quarantine/
 !messages/inbox/.gitkeep
 !messages/outbox/.gitkeep

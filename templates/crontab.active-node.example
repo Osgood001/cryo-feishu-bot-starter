@@ -1,0 +1,7 @@
+# Replace paths/command. The marker must be local to the one active node.
+SHELL=/bin/sh
+PATH=/usr/local/bin:/usr/bin:/bin
+CRYO_CHAMBER=REPLACE_WITH_ABSOLUTE_CHAMBER_PATH
+
+# Marker gate -> single-host lock -> hard timeout -> bounded command.
+*/5 * * * * test -f "$CRYO_CHAMBER/.active-node" && flock -n "$CRYO_CHAMBER/.dispatch.lock" timeout 15m REPLACE_WITH_BOUNDED_COMMAND >> "$CRYO_CHAMBER/dispatch.log" 2>&1

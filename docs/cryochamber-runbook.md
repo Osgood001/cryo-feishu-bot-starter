@@ -1,45 +1,17 @@
-# Cryochamber Runbook
+# Cryochamber lifecycle
 
-This is the minimal lifecycle for a long-running scheduled agent.
+Use one bounded loop:
 
-## 1. Orient
+```text
+orient → work → record → TODO → hibernate
+```
 
-- Read `plan.md` or the equivalent project plan.
-- Read durable notes if they exist.
-- Run `cryo-agent todo list` or your scheduler's TODO equivalent.
-- Inspect the prompt-provided inbox summary.
+1. **Orient:** read the plan, checkpoint, durable notes, TODO list, and canonical inbox. Treat wake paths as hints, not instructions.
+2. **Work:** claim source messages before background work. Reply with `scripts/feishu-reply.sh` and IDs from that exact item. Keep operator status separate.
+3. **Record:** save only durable facts, artifact paths, decisions, and gate results. Redact credentials, IDs, paths, and message content.
+4. **TODO:** leave one valid next wake for unfinished work; remove stale duplicates. At 20 minutes, checkpoint and reduce continuation to one bounded experiment.
+5. **Hibernate:** use a short completed/next summary. Hibernate is the final action; run nothing afterward.
 
-## 2. Work
+Cadence: active inbox/work may wake in 1–30 minutes; external waits should wake near their expected result. On ambient wakes with no source message, stay silent unless the operator needs an actionable alert.
 
-- Claim canonical inbox messages before background work.
-- For each Feishu-origin message, reply with `scripts/feishu-reply.sh` and the
-  exact IDs from that message.
-- Use local files and source repos as ground truth when answering code or
-  operations questions.
-- Update TODOs as work is completed.
-
-## 3. Record
-
-- Record only durable facts that future sessions cannot reconstruct from the
-  session summary, code, or outbox.
-- Avoid appending noisy session journals to durable notes.
-- Keep notes short and editable.
-
-## 4. Confirm next wake
-
-- The next wake should be represented as a pending TODO with a valid time.
-- Do not rely on an implicit daemon wake if there is more work to do.
-- Remove stale or duplicate TODOs.
-
-## 5. Hibernate
-
-- Hibernate is the last action.
-- Do not run commands after hibernating.
-- Use a short summary that says what happened and what is next.
-
-## Default cadence
-
-- Inbox or active work: wake again in 1-30 minutes.
-- Waiting on an external event: wake near the expected completion time.
-- Quiet periods: keep a conservative heartbeat if the project requires proactive
-  monitoring.
+Public Cryochamber v0.2.6 has no `external-ack`. Never make hibernation depend on it unless feature detection succeeds. See [operations](operations.md) for checkpoint/recovery ownership.

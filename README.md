@@ -1,156 +1,119 @@
 # Cryo Feishu Bot Starter
 
-A small starter kit for running a long-lived AI agent that wakes on a schedule,
-handles Feishu/Lark messages, and hibernates cleanly after each session.
+Public-safe reference for a Cryochamber agent that receives Feishu events, replies to the exact source message, records work, schedules its next wake, and hibernates.
 
-This repo is a redacted extraction of an internal Cryochamber + Feishu workflow.
-It keeps the reusable operating model and wrapper scripts, but removes project
-history, credentials, real open IDs, chat IDs, prompts, and host-specific paths.
+## Quickstart
 
-Use it together with the standalone Cryochamber scheduler:
+Prerequisites: Linux, Bash, Git, Python 3.10+, Rust/Cargo, Node.js/npm, [Cryochamber v0.2.6](https://github.com/GiggleLiu/cryochamber), and [lark-cli](https://github.com/larksuite/cli). The Feishu app must be published, have bot capability, subscribe to `im.message.receive_v1`, and have the minimum scopes in [Feishu routing](docs/feishu-routing.md).
 
-- Cryochamber source: https://github.com/Osgood001/cryochamber
-- Current practice version: `0.2.6`
+```bash
+cargo install --git https://github.com/GiggleLiu/cryochamber \
+  --tag v0.2.6 --locked
+npx @larksuite/cli@latest install
+cryo --version && cryo-agent --version && lark-cli --version
+```
 
-## What this gives you
+```bash
+git clone https://github.com/Osgood001/cryo-feishu-bot-starter.git my-feishu-agent
+cd my-feishu-agent
+cp .env.example .env
+chmod 600 .env
+# Replace every REPLACE_WITH_* value; quote values containing spaces.
+```
 
-- A prompt contract for a scheduled agent: orient, work, record, schedule, hibernate.
-- A Feishu reply model that prevents cross-talk by replying with exact
-  `chat_id` + `message_id` pairs from the source message.
-- A separate proactive/status channel for operator notes.
-- Thin `lark-cli` wrappers for listing chats, scanning chat history, and posting
-  proactive messages.
-- A practical install/configuration guide for wiring Cryochamber, a coding
-  agent, and Feishu/Lark together.
-- Redaction and security checklists for publishing agent prompts safely.
+Configure the app without exposing its secret in argv or stdout:
 
-## Non-goals
+```bash
+read -rsp 'Feishu app secret: ' LARK_APP_SECRET; printf '\n'
+printf '%s' "$LARK_APP_SECRET" | lark-cli config init \
+  --name REPLACE_WITH_LARK_PROFILE_NAME \
+  --app-id REPLACE_WITH_FEISHU_APP_ID --app-secret-stdin --brand feishu
+unset LARK_APP_SECRET
+lark-cli --profile REPLACE_WITH_LARK_PROFILE_NAME whoami
+```
 
-- This does not include Feishu app credentials or a hosted message bridge.
-- This does not include any production monitoring, database, or secret manager.
-- This does not publish private production prompts, open IDs, chat IDs, access
-  keys, message history, or host-specific paths.
+Bot identity comes from the app credentials and bot scopes; it must not run
+`auth login`. Only add user OAuth when a deliberate user-only message operation
+requires it. Start the least-privilege split flow, then generate a QR image at a
+relative path from the returned `verification_url`:
 
-## Quick start
+```bash
+lark-cli --profile REPLACE_WITH_LARK_PROFILE_NAME auth login \
+  --scope "im:message.send_as_user im:message" --no-wait --json
+lark-cli auth qrcode '<verification_url>' --output auth-qr.png
+```
 
-1. Install Cryochamber:
+Show the URL and QR image to the user. Only after they confirm authorization,
+complete the flow in a later step, then remove the QR image. Do not save or log
+the `device_code`:
 
-   ```bash
-   cargo install --git https://github.com/Osgood001/cryochamber --locked
-   cryo --version
-   cryo-agent --version
-   ```
+```bash
+lark-cli --profile REPLACE_WITH_LARK_PROFILE_NAME auth login \
+  --device-code '<device_code>'
+rm -f auth-qr.png
+```
 
-   The versions should match. This starter currently documents `0.2.6`.
+Install/start the chamber, then run the connector manually or from a supplied supervisor template:
 
-2. Install and authenticate `lark-cli` for your Feishu app. Your bot identity
-   needs message send/read scopes for group routing; user identity is optional
-   unless you need user-only Feishu operations.
+```bash
+cryo init --agent codex
+set -a; . ./.env; set +a
+python3 connector/feishu_connector.py check
+cryo start --agent codex
+# separate terminal, or systemd/supervisord:
+python3 connector/feishu_connector.py run
+```
 
-3. Create a chamber and copy the starter files:
+Before using credentials or network, run the deterministic fake-only smoke and full tests:
 
-   ```bash
-   mkdir my-feishu-agent
-   cd my-feishu-agent
-   cryo init --agent codex
-   git clone https://github.com/Osgood001/cryo-feishu-bot-starter.git starter
-   cp -R starter/scripts starter/docs starter/examples starter/AGENTS.md .
-   cp starter/.env.example .env
-   ```
+```bash
+scripts/smoke-test.sh
+python3 -m unittest discover -s tests -v
+python3 scripts/secret-scan.py
+```
 
-4. Fill in `.env`, especially:
+The smoke queues an exact-ID reply, delivers it only to recording fakes, and proves proactive `DRY_RUN=1` does not invoke even the fake CLI.
 
-   ```bash
-   LARK_CLI_PROFILE=your_lark_cli_profile
-   LARK_CLI_IDENTITY=bot
-   FEISHU_OUTBOX_DIR=messages/outbox
-   OPERATOR_OPEN_ID=ou_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
-   ```
+## Architecture
 
-5. Wire your Feishu inbox bridge to write Feishu-origin messages with frontmatter like
-   `examples/inbox-message.md`.
+```text
+Feishu event websocket              exact reply outbox
+          │                                 │
+          ▼                                 ▼
+ lark-cli --as bot ──► connector ──► messages/inbox ──► agent session
+                           ▲                                   │
+                           └──── ledger / ack / quarantine ◄───┘
+operator status: agent ──► proactive-post.sh --user ──► operator DM
+```
 
-6. Put the hard routing rules from `AGENTS.md` and the workflow in
-   `docs/sanitized-prompt.md` into your agent prompt. In Feishu chambers, these
-   rules intentionally override Cryochamber's generic local-outbox reply path:
-   Feishu user replies go through `scripts/feishu-reply.sh`, while operator
-   status goes through `scripts/proactive-post.sh --user`.
-
-7. Start the chamber:
-
-   ```bash
-   cryo start --agent codex
-   ```
-
-8. In each session the agent should:
-   - read the plan and TODOs,
-   - inspect or claim inbox messages,
-   - answer Feishu messages with `scripts/feishu-reply.sh`,
-   - send operator status with `scripts/proactive-post.sh --user ...`,
-   - leave a next TODO before hibernating.
-
-See [docs/setup-guide.md](docs/setup-guide.md) for a fuller end-to-end setup
-and validation checklist.
-
-## Repository layout
+Public Cryochamber v0.2.6 does **not** provide `external-ack`; the connector probes `cryo-agent external-ack --help` and skips that step when absent. There is no inbound polling fallback and no bot-created/own-thread routing. Thread metadata is preserved only so a reply remains tied to its source message.
 
 ```text
 .
-├── AGENTS.md                    # Agent-facing hard rules
-├── docs/
-│   ├── cryochamber-runbook.md   # Session lifecycle
-│   ├── feishu-routing.md        # Reply/status routing model
-│   ├── redaction-checklist.md   # What to remove before publishing
-│   ├── setup-guide.md           # End-to-end install/config guide
-│   ├── sanitized-prompt.md      # Prompt template with placeholders
-│   └── security.md              # Operational safety notes
-├── examples/
-│   ├── inbox-message.md         # Feishu-origin message example
-│   └── outbox-reply.md          # Routed reply file example
-├── scripts/
-│   ├── feishu-reply.sh          # Queue exact-message replies
-│   ├── proactive-post.sh        # Post proactive/operator messages
-│   ├── list-chats.sh            # List group chats visible to the bot
-│   ├── scan-all.sh              # Scan recent messages across chats
-│   ├── scan-chat.sh             # Scan one chat timeline
-│   ├── _list_chats.py
-│   └── _scan_chat.py
-└── messages/
-    ├── inbox/.gitkeep
-    └── outbox/.gitkeep
+├── connector/feishu_connector.py    websocket + exact-reply reference
+├── scripts/                         reply/status wrappers, smoke, scans
+├── templates/                       systemd, supervisord, cron, SSH
+├── tests/                            hermetic fakes and contracts
+├── docs/                             deployment and operating details
+└── messages/{inbox,outbox}/          local handoff directories
 ```
 
-## Core rule
+## Session contract
 
-Do not use a local/operator outbox as a Feishu reply. A Feishu-origin message
-must be answered with the exact `feishu_chat_id` and `feishu_message_id` from
-that message:
-
-```bash
-printf '%s\n' "Reply text" \
-  | scripts/feishu-reply.sh oc_xxx om_xxx
+```text
+orient → work → record → TODO → hibernate
 ```
 
-Operator status is a different channel:
+Reply to each Feishu item with its own `feishu_chat_id` + `feishu_message_id`. Route progress and wake notes to the operator DM. With no user message, remain silent unless an operator alert is actionable. At 20 minutes, checkpoint, leave one bounded continuation TODO, then hibernate.
 
-```bash
-printf '%s\n' "Short status, next wake: 2026-01-01T10:30" \
-  | scripts/proactive-post.sh --user ou_operator_xxx
-```
+## Detailed guides
 
-## Minimal validation
+- [Setup and service templates](docs/setup-guide.md)
+- [Feishu app, identities, scopes, and routing](docs/feishu-routing.md)
+- [Token migration, rotation, backup, and restore](docs/credentials.md)
+- [SSH migration](docs/ssh-migration.md)
+- [Bounded operations, recovery, upgrade, and rollback](docs/operations.md)
+- [Capability matrix and security checklist](docs/security.md)
+- [Lifecycle runbook](docs/cryochamber-runbook.md)
 
-```bash
-scripts/list-chats.sh
-scripts/scan-chat.sh oc_xxx 5
-printf '%s\n' "test reply" | scripts/feishu-reply.sh oc_xxx om_xxx
-printf '%s\n' "operator test" | scripts/proactive-post.sh --user ou_xxx
-cryo-agent todo add "heartbeat" --at "+30 minutes"
-cryo-agent hibernate --summary "setup validation complete"
-```
-
-Use real `oc_...` and `om_...` IDs only from a test message you control.
-
-## License
-
-MIT
+License: MIT.

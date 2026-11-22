@@ -12,7 +12,7 @@ if [ -z "$CHAT" ]; then
 fi
 
 PROFILE="${LARK_CLI_PROFILE:-}"
-cmd=(lark-cli)
+cmd=("${LARK_CLI:-lark-cli}")
 if [ -n "$PROFILE" ]; then
   cmd+=(--profile "$PROFILE")
 fi
