@@ -1,6 +1,6 @@
 # Cryo Feishu Bot Starter
 
-Public-safe reference for a Cryochamber agent that receives Feishu events, replies to the exact source message, records work, schedules its next wake, and hibernates.
+Public-safe reference for a Cryochamber agent that receives Feishu events with structured context injection, responds fast to the exact source message, offloads heavy jobs asynchronously, records work, schedules its next wake, and hibernates.
 
 ## Quickstart
 
@@ -77,43 +77,49 @@ The smoke queues an exact-ID reply, delivers it only to recording fakes, and pro
 ## Architecture
 
 ```text
-Feishu event websocket              exact reply outbox
+Feishu event websocket              exact reply outbox (feishu-reply.sh)
           │                                 │
           ▼                                 ▼
- lark-cli --as bot ──► connector ──► messages/inbox ──► agent session
-                           ▲                                   │
-                           └──── ledger / ack / quarantine ◄───┘
+ lark-cli --as bot ──► connector ──► messages/inbox ──► triage session (fast)
+                           ▲         (+ mentions/ctx/          │
+                           │          exact reply hint)        ├──► tmux worker (strong model)
+                           └──── ledger / ack / quarantine ◄───┘         └─► RESULT.md + log
 operator status: agent ──► proactive-post.sh --user ──► operator DM
 ```
 
-Public Cryochamber v0.2.6 does **not** provide `external-ack`; the connector probes `cryo-agent external-ack --help` and skips that step when absent. There is no inbound polling fallback and no bot-created/own-thread routing. Thread metadata is preserved only so a reply remains tied to its source message.
+Every inbound Feishu inbox file carries exact IDs (`feishu_chat_id`, `feishu_message_id`), resolved `@` mentions (`<at user_id="open_id">Name</at>` mapping), and the exact `scripts/feishu-reply.sh` command hint. Setting `FEISHU_CONTEXT_MESSAGES` (default `0`, opt-in up to `50`) adds best-effort thread, recent-chat, and quoted-parent excerpts via `lark-cli` when read scopes are granted.
+
+Public Cryochamber v0.2.6 does **not** provide `external-ack`; the connector probes `cryo-agent external-ack --help` and skips that step when absent. There is no inbound polling fallback and no bot-created/own-thread routing. Thread metadata and context excerpts are preserved only for comprehension while every reply remains tied to its exact source message.
 
 ```text
 .
-├── connector/feishu_connector.py    websocket + exact-reply reference
+├── connector/feishu_connector.py    websocket + context injection + exact-reply reference
 ├── scripts/                         reply/status wrappers, smoke, scans
 ├── templates/                       systemd, supervisord, cron, SSH
-├── tests/                            hermetic fakes and contracts
-├── docs/                             deployment and operating details
-└── messages/{inbox,outbox}/          local handoff directories
+├── tests/                           hermetic fakes and contracts
+├── docs/                            deployment, prompt, and operating details
+└── messages/{inbox,outbox}/         local handoff directories
 ```
 
 ## Session contract
 
 ```text
-orient → work → record → TODO → hibernate
+claim & fast first reply → orient → work / offload → record → TODO → hibernate
 ```
 
-Reply to each Feishu item with its own `feishu_chat_id` + `feishu_message_id`. Route progress and wake notes to the operator DM. With no user message, remain silent unless an operator alert is actionable. At 20 minutes, checkpoint, leave one bounded continuation TODO, then hibernate.
+- **Fast first reply:** right after claiming inbox messages (before deep exploration), answer within 2 quick tool calls or immediately send a short receipt + ETA via `scripts/feishu-reply.sh`.
+- **Heavy-task async offload:** keep the primary session responsive; offload complex or >20-minute work to a named `tmux` worker running a stronger model that writes `work/<task-id>/RESULT.md` + log, then verify independently on follow-up and close the session.
+- **Channel separation:** reply to each Feishu item with its own `feishu_chat_id` + `feishu_message_id` (never `cryo-agent send`). Route progress and wake notes to the operator DM (`scripts/proactive-post.sh --user`). With no user message, remain silent unless an operator alert is actionable. At 20 minutes, checkpoint, leave one bounded continuation TODO, then hibernate.
 
 ## Detailed guides
 
 - [Setup and service templates](docs/setup-guide.md)
 - [Feishu app, identities, scopes, and routing](docs/feishu-routing.md)
+- [Sanitized prompt template](docs/sanitized-prompt.md)
+- [Lifecycle runbook](docs/cryochamber-runbook.md)
 - [Token migration, rotation, backup, and restore](docs/credentials.md)
 - [SSH migration](docs/ssh-migration.md)
 - [Bounded operations, recovery, upgrade, and rollback](docs/operations.md)
 - [Capability matrix and security checklist](docs/security.md)
-- [Lifecycle runbook](docs/cryochamber-runbook.md)
 
 License: MIT.

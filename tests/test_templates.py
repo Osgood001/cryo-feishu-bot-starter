@@ -45,6 +45,7 @@ class TemplateTests(unittest.TestCase):
         self.assertEqual(connector_vars - names, set())
         defaults = {
             "OUTBOX_POLL_SEC", "DEADLETTER_AFTER_SEC", "MAX_REPLY_CHARS",
+            "FEISHU_CONTEXT_MESSAGES",
             "LARK_CLI_IDENTITY", "FEISHU_SCAN_AS_PRIMARY", "FEISHU_SCAN_AS_FALLBACK",
         }
         for line in env_text.splitlines():
@@ -116,6 +117,30 @@ class TemplateTests(unittest.TestCase):
         self.assertIn("does not prove server-side", credentials)
         connector = (ROOT / "connector/feishu_connector.py").read_text(encoding="utf-8")
         self.assertNotIn("templates/connector.env.example", connector)
+
+    def test_fast_first_reply_async_offload_and_context_docs_contract(self):
+        for rel in [
+            "AGENTS.md",
+            "README.md",
+            "docs/sanitized-prompt.md",
+            "docs/cryochamber-runbook.md",
+            "docs/feishu-routing.md",
+        ]:
+            text = (ROOT / rel).read_text(encoding="utf-8")
+            self.assertNotRegex(text, r"/home/[A-Za-z0-9._-]+/", rel)
+            self.assertNotRegex(text, r"\b(?:ou|oc|om)_[A-Za-z0-9]{20,}\b", rel)
+
+        for rel in ["AGENTS.md", "docs/sanitized-prompt.md", "docs/cryochamber-runbook.md", "README.md"]:
+            text = (ROOT / rel).read_text(encoding="utf-8")
+            self.assertIn("fast first reply", text.lower(), rel)
+            self.assertIn("RESULT.md", text, rel)
+            self.assertIn("tmux", text, rel)
+
+        routing = (ROOT / "docs/feishu-routing.md").read_text(encoding="utf-8")
+        self.assertIn("FEISHU_CONTEXT_MESSAGES", routing)
+        self.assertIn('<at user_id="open_id">Name</at>', routing)
+        self.assertIn("CRYO_EXTERNAL_REPLY_SOURCE=feishu", routing)
+        self.assertFalse((ROOT / "examples" / "domain-bot").exists())
 
 
 if __name__ == "__main__":

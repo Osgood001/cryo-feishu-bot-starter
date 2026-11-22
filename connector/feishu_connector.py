@@ -2,7 +2,8 @@
 """Reference Feishu/Lark <-> Cryochamber connector (standard library only).
 
 Inbound : `lark-cli event consume im.message.receive_v1 --as bot` (one JSON event per line)
-          -> handled messages become messages/inbox/*.md with exact-ID frontmatter.
+          -> handled messages become messages/inbox/*.md with exact-ID frontmatter,
+             @ mention mapping, exact reply command hint, and optional thread/chat context.
 Outbound: messages/outbox/*.md written by scripts/feishu-reply.sh
           -> reply to that exact source message (idempotency key), record the delivery in a
              ledger, then `cryo-agent external-ack` (if the installed Cryochamber supports it),
@@ -46,15 +47,20 @@ SIGNATURE = ENV.get("BOT_SIGNATURE", "")
 POLL_SEC = float(ENV.get("OUTBOX_POLL_SEC", "2"))
 DEADLETTER_AFTER_SEC = int(ENV.get("DEADLETTER_AFTER_SEC", "900"))
 MAX_REPLY_CHARS = int(ENV.get("MAX_REPLY_CHARS", "20000"))
+CONTEXT_MESSAGES = max(0, min(50, int(ENV.get("FEISHU_CONTEXT_MESSAGES", "0"))))
+CONTEXT_ITEM_CHARS = 300
+QUOTED_MAX_CHARS = 500
 SOURCE = "feishu"
 
 CHAT_RE = re.compile(r"^oc_[A-Za-z0-9]+$")
 MSG_RE = re.compile(r"^om_[A-Za-z0-9]+$")
+THREAD_RE = re.compile(r"^omt_[A-Za-z0-9]+$")
+OPEN_ID_RE = re.compile(r"^ou_[A-Za-z0-9]+$")
 # Feishu "the source message no longer exists" -> safe to post top-level in the same chat.
 INVALID_SOURCE_CODES = {99992354}
 SKIP_TYPES = {"system", "share_calendar_event", "calendar", "red_packet"}
 
-_ID_RE = re.compile(r"\b(ou|oc|om|on|cli)_[A-Za-z0-9]{4,}")
+_ID_RE = re.compile(r"\b(ou|oc|om|omt|on|cli)_[A-Za-z0-9]{4,}")
 _SECRET_RE = re.compile(r"(?i)(bearer\s+|token[\"'=: ]+|secret[\"'=: ]+)[A-Za-z0-9._\-]{8,}")
 
 
@@ -75,6 +81,23 @@ def _lark(*args):
     if PROFILE:
         cmd += ["--profile", PROFILE]
     return cmd + list(args)
+
+
+def _lark_json(*args, timeout=20):
+    """Run lark-cli and parse one JSON object; return None on any error."""
+    try:
+        res = subprocess.run(_lark(*args), capture_output=True, text=True,
+                             timeout=timeout, stdin=subprocess.DEVNULL)
+    except (OSError, subprocess.SubprocessError) as exc:
+        log("lark-cli context fetch failed:", exc)
+        return None
+    if res.returncode != 0:
+        return None
+    try:
+        data = json.loads(res.stdout or "{}")
+    except ValueError:
+        return None
+    return data if isinstance(data, dict) else None
 
 
 def _atomic_write(path, data, mode=0o600):
@@ -125,19 +148,219 @@ def _mark_seen(message_id):
     _atomic_write(os.path.join(SEEN, key), "seen\n", mode=0o600)
 
 
+def _flatten_post(data):
+    """Flatten a Feishu rich-text `post` payload to plain text."""
+    if not isinstance(data, dict):
+        return ""
+    if "content" not in data:
+        for value in data.values():
+            if isinstance(value, dict) and "content" in value:
+                data = value
+                break
+    rows = data.get("content")
+    if not isinstance(rows, list):
+        return ""
+    lines = []
+    for row in rows:
+        if not isinstance(row, list):
+            continue
+        parts = []
+        for seg in row:
+            if not isinstance(seg, dict):
+                continue
+            if seg.get("tag") == "at":
+                name = str(seg.get("user_name") or "").strip()
+                parts.append("@" + name if name else "@")
+            else:
+                parts.append(str(seg.get("text") or ""))
+        lines.append("".join(parts))
+    title = str(data.get("title") or "").strip()
+    body = "\n".join(lines).strip()
+    return (title + "\n" + body).strip() if title else body
+
+
 def _text_of(content):
     """lark-cli pre-renders most message types to readable text; tolerate raw JSON too."""
     if isinstance(content, dict):
-        return str(content.get("text", ""))
+        if "text" in content and "content" not in content:
+            return str(content.get("text", ""))
+        return _flatten_post(content) or json.dumps(content, ensure_ascii=False)
     text = str(content or "")
     if text.startswith("{"):
         try:
             data = json.loads(text)
-            if isinstance(data, dict) and isinstance(data.get("text"), str):
-                return data["text"]
+            if isinstance(data, dict):
+                if isinstance(data.get("text"), str) and "content" not in data:
+                    return data["text"]
+                flat = _flatten_post(data)
+                if flat:
+                    return flat
         except ValueError:
             pass
     return text
+
+
+def _mention_open_id(mention):
+    """Extract an open_id string from flat or nested Feishu mention dicts."""
+    if not isinstance(mention, dict):
+        return ""
+    raw_id = mention.get("id")
+    if isinstance(raw_id, dict):
+        raw_id = raw_id.get("open_id") or raw_id.get("user_id") or ""
+    return str(raw_id or "").strip()
+
+
+def _extract_mentions(ev):
+    """Return deduplicated [(display_name, open_id)] for non-bot @mentions."""
+    seen, out = set(), []
+    for item in (ev.get("mentions") or []):
+        open_id = _mention_open_id(item)
+        if not OPEN_ID_RE.match(open_id) or open_id == BOT_OPEN_ID or open_id in seen:
+            continue
+        seen.add(open_id)
+        name = str(item.get("name") or "").strip() or open_id
+        out.append((name, open_id))
+    return out
+
+
+def _resolve_mentions_in_text(text, mentions):
+    """Replace placeholder mention keys (e.g. @_user_1) with @DisplayName."""
+    for item in (mentions or []):
+        if not isinstance(item, dict):
+            continue
+        key = str(item.get("key") or "").strip()
+        name = str(item.get("name") or "").strip()
+        if key and name and key in text:
+            text = text.replace(key, "@" + name)
+    return text
+
+
+def _compact_excerpt(text, limit):
+    return " ".join(str(text or "").split())[:limit]
+
+
+def _sender_label(msg):
+    """Human-readable label for a context message sender."""
+    sender = msg.get("sender") if isinstance(msg.get("sender"), dict) else {}
+    sid = str(sender.get("id") or msg.get("sender_id") or "").strip()
+    if BOT_OPEN_ID and sid == BOT_OPEN_ID:
+        return "bot"
+    if str(sender.get("sender_type") or msg.get("sender_type") or "").strip() == "app":
+        return "bot"
+    name = str(msg.get("sender_name") or sender.get("name") or "").strip()
+    if name:
+        return name
+    return "user"
+
+
+def _fetch_quoted(parent_id):
+    if not MSG_RE.match(parent_id or ""):
+        return None
+    data = _lark_json("im", "+messages-mget", "--message-ids", parent_id,
+                      "--as", "bot", "--format", "json")
+    if not data:
+        return None
+    payload = data.get("data") or {}
+    items = payload.get("messages") or payload.get("items") or []
+    if not items or not isinstance(items[0], dict):
+        return None
+    parent = items[0]
+    raw_content = parent.get("content")
+    if raw_content is None and isinstance(parent.get("body"), dict):
+        raw_content = parent["body"].get("content")
+    text = _compact_excerpt(_text_of(raw_content), QUOTED_MAX_CHARS)
+    if not text:
+        return None
+    return (_sender_label(parent), text)
+
+
+def _extract_context_items(messages, current_mid, reverse=False):
+    items = list(reversed(messages)) if reverse else list(messages)
+    out = []
+    for msg in items:
+        if not isinstance(msg, dict):
+            continue
+        if str(msg.get("message_id") or "") == current_mid:
+            continue
+        raw_content = msg.get("content")
+        if raw_content is None and isinstance(msg.get("body"), dict):
+            raw_content = msg["body"].get("content")
+        text = _compact_excerpt(_text_of(raw_content), CONTEXT_ITEM_CHARS)
+        if not text:
+            continue
+        out.append((_sender_label(msg), text))
+    return out
+
+
+def _fetch_thread_context(thread_id, current_mid, limit):
+    if not THREAD_RE.match(thread_id or "") or limit <= 0:
+        return []
+    data = _lark_json("im", "+threads-messages-list", "--thread", thread_id,
+                      "--as", "bot", "--order", "asc", "--no-reactions",
+                      "--page-size", str(limit), "--format", "json")
+    if not data:
+        return []
+    payload = data.get("data") or {}
+    msgs = payload.get("messages") or payload.get("items") or []
+    return _extract_context_items(msgs, current_mid, reverse=False)
+
+
+def _fetch_recent_chat(chat_id, current_mid, limit):
+    if not CHAT_RE.match(chat_id or "") or limit <= 0:
+        return []
+    data = _lark_json("im", "+chat-messages-list", "--chat-id", chat_id,
+                      "--as", "bot", "--order", "desc", "--no-reactions",
+                      "--page-size", str(limit), "--format", "json")
+    if not data:
+        return []
+    payload = data.get("data") or {}
+    msgs = payload.get("messages") or payload.get("items") or []
+    return _extract_context_items(msgs, current_mid, reverse=True)
+
+
+def _conversation_context(ev, chat, mid):
+    """Return (kind, [(sender, excerpt), ...], quoted_or_none).
+
+    Uses pre-supplied event context when present; otherwise fetches via lark-cli
+    only when FEISHU_CONTEXT_MESSAGES > 0 (opt-in, best-effort).
+    """
+    chat_type = str(ev.get("chat_type") or "")
+    thread_id = str(ev.get("thread_id") or "")
+    reply_to = str(ev.get("reply_to") or ev.get("parent_id") or "")
+
+    quoted = None
+    inline_quoted = ev.get("quoted_message")
+    if isinstance(inline_quoted, dict):
+        qtext = _compact_excerpt(_text_of(inline_quoted.get("text") or inline_quoted.get("content")),
+                                 QUOTED_MAX_CHARS)
+        if qtext:
+            quoted = (str(inline_quoted.get("sender") or "user"), qtext)
+    elif CONTEXT_MESSAGES > 0 and MSG_RE.match(reply_to):
+        quoted = _fetch_quoted(reply_to)
+
+    inline_ctx = ev.get("context_messages")
+    if isinstance(inline_ctx, list) and inline_ctx:
+        kind = "thread" if (chat_type != "p2p" and THREAD_RE.match(thread_id)) else "chat"
+        entries = []
+        for item in inline_ctx[-max(CONTEXT_MESSAGES, 20):]:
+            if isinstance(item, dict):
+                txt = _compact_excerpt(_text_of(item.get("text") or item.get("content")), CONTEXT_ITEM_CHARS)
+                if txt:
+                    entries.append((str(item.get("sender") or "user"), txt))
+        if entries:
+            return kind, entries, quoted
+
+    if CONTEXT_MESSAGES <= 0:
+        return "", [], quoted
+
+    if chat_type != "p2p" and THREAD_RE.match(thread_id):
+        entries = _fetch_thread_context(thread_id, mid, CONTEXT_MESSAGES)
+        if entries:
+            return "thread", entries, quoted
+    entries = _fetch_recent_chat(chat, mid, CONTEXT_MESSAGES)
+    if entries:
+        return "chat", entries, quoted
+    return "", [], quoted
 
 
 def should_handle(ev, text):
@@ -145,7 +368,7 @@ def should_handle(ev, text):
     if ev.get("chat_type") == "p2p":
         return True
     mentions = ev.get("mentions") or []
-    if BOT_OPEN_ID and any(isinstance(m, dict) and m.get("id") == BOT_OPEN_ID for m in mentions):
+    if BOT_OPEN_ID and any(_mention_open_id(m) == BOT_OPEN_ID for m in mentions):
         return True
     return bool(BOT_NAME) and ("@" + BOT_NAME).lower() in text.lower()
 
@@ -158,12 +381,18 @@ def write_inbox(ev):
         return None
     if ev.get("message_type") in SKIP_TYPES:
         return None
-    text = _text_of(ev.get("content")).strip()
+    raw_mentions = ev.get("mentions") or []
+    text = _resolve_mentions_in_text(_text_of(ev.get("content")).strip(), raw_mentions)
     if not text or not should_handle(ev, text) or not _claim(mid):
         return None
+    sender_name = str(ev.get("sender_name") or "").strip()
+    reply_to = str(ev.get("reply_to") or ev.get("parent_id") or "").strip()
+    thread_id = str(ev.get("thread_id") or "").strip()
+    mention_pairs = _extract_mentions(ev)
+    convo_kind, convo_msgs, quoted = _conversation_context(ev, chat, mid)
     stamp = time.strftime("%Y-%m-%dT%H-%M-%S")
     path = os.path.join(INBOX, "%s_%s.md" % (stamp, hashlib.sha256(mid.encode()).hexdigest()[:12]))
-    front = [
+    lines = [
         "---",
         "from: feishu",
         "source: feishu",
@@ -171,13 +400,42 @@ def write_inbox(ev):
         "feishu_message_id: " + mid,
         "feishu_chat_type: " + (ev.get("chat_type") or "unknown"),
         "feishu_sender: " + (ev.get("sender_id") or "unknown"),
-        "feishu_thread_id: " + (ev.get("thread_id") or ""),
+        "feishu_sender_name: " + sender_name,
+        "feishu_mentions: " + "; ".join("%s=%s" % (name, oid) for name, oid in mention_pairs),
+        "feishu_reply_to: " + reply_to,
+        "feishu_thread_id: " + thread_id,
         "---",
         "",
         text,
         "",
+        "---",
     ]
-    _atomic_write(path, "\n".join(front), mode=0o600)
+    if sender_name:
+        lines.append("System note: sender display name: " + sender_name)
+    if convo_msgs:
+        label = "thread" if convo_kind == "thread" else "recent chat"
+        lines.append("System note: %s context (chronological; use for follow-ups):" % label)
+        for who, excerpt in convo_msgs:
+            lines.append("> [%s] %s" % (who, excerpt))
+    if quoted:
+        qwho, qtext = quoted
+        lines.append("System note: quoted parent message (target of 'this/that/above'):")
+        lines.append("> [%s] %s" % (qwho, qtext))
+    if mention_pairs:
+        mapping = "; ".join("%s=%s" % (name, oid) for name, oid in mention_pairs)
+        lines.append(
+            'System note: mentioned users (use <at user_id="open_id">Name</at> to mention): '
+            + mapping
+        )
+    lines += [
+        "System note: reply ONLY to this exact message with:",
+        "```bash",
+        "printf '%%s\\n' \"<reply>\" | scripts/feishu-reply.sh %s %s --stdin" % (chat, mid),
+        "```",
+        "Do not reuse IDs from another message, and do not use cryo-agent send for Feishu replies.",
+        "",
+    ]
+    _atomic_write(path, "\n".join(lines), mode=0o600)
     _mark_seen(mid)
     log("inbox <-", mid, "chat", chat)
     return path
@@ -392,7 +650,9 @@ def main(argv):
     if mode == "check":
         print(json.dumps({"chamber": CHAMBER, "state": STATE, "lark_cli": LARK, "profile_set": bool(PROFILE),
                           "bot_name_set": bool(BOT_NAME), "bot_open_id_set": bool(BOT_OPEN_ID),
-                          "deadletter_after_sec": DEADLETTER_AFTER_SEC, "external_ack": ack_supported()}, indent=1))
+                          "deadletter_after_sec": DEADLETTER_AFTER_SEC,
+                          "context_messages": CONTEXT_MESSAGES,
+                          "external_ack": ack_supported()}, indent=1))
         return 0
     if mode == "once":
         print("handled", process_outbox_once())
