@@ -34,6 +34,7 @@ class ConnectorTests(unittest.TestCase):
         connector.BOT_OPEN_ID = "ou_Bot1234"
         connector.SIGNATURE = ""
         connector.DEADLETTER_AFTER_SEC = 10
+        connector.CONTEXT_MESSAGES = 0
         connector._ACK_SUPPORTED = None
         connector._ensure_dirs()
 
@@ -182,6 +183,167 @@ class ConnectorTests(unittest.TestCase):
         self.assertNotIn("SecretMessage123", value)
         self.assertNotIn("abcdefghijk", value)
         self.assertIn("<redacted>", value)
+
+    def test_inbound_mentions_mapping_and_reply_command_hint(self):
+        ev = self.event(
+            mid="om_MentionMsg1",
+            chat="oc_GroupChat1",
+            chat_type="group",
+            sender_name="Alice",
+            parent_id="om_Parent1",
+            content='{"text":"@_user_1 @_user_2 please review"}',
+            mentions=[
+                {"key": "@_user_1", "name": "Helper", "id": {"open_id": "ou_Bot1234"}},
+                {"key": "@_user_2", "name": "Bob", "id": {"open_id": "ou_Bob5678"}},
+                {"key": "@_user_3", "name": "Bob", "id": "ou_Bob5678"},
+            ],
+        )
+        path = connector.write_inbox(ev)
+        self.assertTrue(path)
+        text = Path(path).read_text(encoding="utf-8")
+        self.assertIn("feishu_sender_name: Alice", text)
+        self.assertIn("feishu_mentions: Bob=ou_Bob5678", text)
+        self.assertIn("feishu_reply_to: om_Parent1", text)
+        self.assertIn("@Helper @Bob please review", text)
+        self.assertNotIn("@_user_2", text)
+        self.assertNotIn("ou_Bot1234", text)
+        self.assertIn('<at user_id="open_id">Name</at>', text)
+        self.assertIn("Bob=ou_Bob5678", text)
+        self.assertIn(
+            "scripts/feishu-reply.sh oc_GroupChat1 om_MentionMsg1 --stdin", text
+        )
+        self.assertIn("do not use cryo-agent send", text)
+
+    def test_inbound_post_rich_text_extraction(self):
+        post_content = json.dumps({
+            "zh_cn": {
+                "title": "Release Check",
+                "content": [
+                    [
+                        {"tag": "at", "user_name": "Helper"},
+                        {"tag": "text", "text": " verify pipeline status"},
+                    ]
+                ],
+            }
+        })
+        ev = self.event(
+            mid="om_PostMsg1",
+            chat="oc_GroupChat2",
+            chat_type="group",
+            message_type="post",
+            content=post_content,
+        )
+        path = connector.write_inbox(ev)
+        self.assertTrue(path)
+        text = Path(path).read_text(encoding="utf-8")
+        self.assertIn("Release Check\n@Helper verify pipeline status", text)
+
+    def test_inbound_thread_and_quoted_context_injection(self):
+        connector.CONTEXT_MESSAGES = 10
+
+        def fake_lark_json(*args, **_kwargs):
+            if "+threads-messages-list" in args:
+                return {
+                    "data": {
+                        "messages": [
+                            {
+                                "message_id": "om_Root1",
+                                "sender": {"id": "ou_Alice1", "name": "Alice"},
+                                "content": '{"text":"Can we ship build 7?"}',
+                            },
+                            {
+                                "message_id": "om_BotReply1",
+                                "sender": {"id": "ou_Bot1234"},
+                                "content": '{"text":"Running checks now."}',
+                            },
+                            {
+                                "message_id": "om_Followup1",
+                                "sender": {"id": "ou_Alice1", "name": "Alice"},
+                                "content": '{"text":"@Helper any update?"}',
+                            },
+                        ]
+                    }
+                }
+            if "+messages-mget" in args:
+                return {
+                    "data": {
+                        "messages": [
+                            {
+                                "message_id": "om_BotReply1",
+                                "sender": {"id": "ou_Bot1234"},
+                                "content": '{"text":"Running checks now."}',
+                            }
+                        ]
+                    }
+                }
+            return None
+
+        ev = self.event(
+            mid="om_Followup1",
+            chat="oc_GroupChat3",
+            chat_type="group",
+            thread_id="omt_Thread99",
+            parent_id="om_BotReply1",
+            content='{"text":"@Helper any update?"}',
+        )
+        with mock.patch.object(connector, "_lark_json", side_effect=fake_lark_json):
+            path = connector.write_inbox(ev)
+        self.assertTrue(path)
+        text = Path(path).read_text(encoding="utf-8")
+        self.assertIn("System note: thread context (chronological", text)
+        self.assertIn("> [Alice] Can we ship build 7?", text)
+        self.assertIn("> [bot] Running checks now.", text)
+        self.assertNotIn("> [Alice] @Helper any update?", text)
+        self.assertIn("System note: quoted parent message", text)
+
+    def test_inbound_p2p_recent_chat_chronological_and_non_fatal_failure(self):
+        connector.CONTEXT_MESSAGES = 5
+
+        def fake_chat(*args, **_kwargs):
+            if "+chat-messages-list" in args:
+                # Feishu returns newest-first for --order desc.
+                return {
+                    "data": {
+                        "messages": [
+                            {
+                                "message_id": "om_P2pCur",
+                                "sender": {"id": "ou_User1", "name": "User"},
+                                "content": '{"text":"is it done?"}',
+                            },
+                            {
+                                "message_id": "om_P2pPrev2",
+                                "sender": {"id": "ou_Bot1234"},
+                                "content": '{"text":"Second step running."}',
+                            },
+                            {
+                                "message_id": "om_P2pPrev1",
+                                "sender": {"id": "ou_User1", "name": "User"},
+                                "content": '{"text":"First request."}',
+                            },
+                        ]
+                    }
+                }
+            return None
+
+        with mock.patch.object(connector, "_lark_json", side_effect=fake_chat):
+            path = connector.write_inbox(
+                self.event(mid="om_P2pCur", content='{"text":"is it done?"}')
+            )
+        text = Path(path).read_text(encoding="utf-8")
+        self.assertIn("System note: recent chat context (chronological", text)
+        self.assertLess(
+            text.index("> [User] First request."),
+            text.index("> [bot] Second step running."),
+        )
+
+        # Lookup errors must never block inbox delivery.
+        with mock.patch.object(connector, "_lark_json", return_value=None):
+            fallback_path = connector.write_inbox(
+                self.event(mid="om_P2pFallback", content='{"text":"hello"}')
+            )
+        self.assertTrue(fallback_path)
+        fallback_text = Path(fallback_path).read_text(encoding="utf-8")
+        self.assertIn("scripts/feishu-reply.sh oc_Chat1 om_P2pFallback --stdin", fallback_text)
 
 
 if __name__ == "__main__":
